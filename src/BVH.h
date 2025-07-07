@@ -2,6 +2,11 @@
 #include "HittableList.h"
 #include "Ray.h"
 
+#define SHARED_STACK_SIZE 8
+#define LOCAL_STACK_SIZE  8
+#define STACK_SIZE		  (SHARED_STACK_SIZE + LOCAL_STACK_SIZE)
+#define MAX_THREADS		  64 // Match your block size
+
 namespace BVH
 {
 	// Note: Could use this as a class with member functions but NVCC wouldn't show them in PTXAS info
@@ -340,21 +345,52 @@ namespace BVH
 		return AddNode(leftIdx, rightIdx, combined);
 	}
 
+	inline __device__ void StackPush(uint32_t value, int& stackPtr, uint16_t* sharedStackData, uint16_t* localStackData)
+	{
+		if (stackPtr < SHARED_STACK_SIZE)
+			sharedStackData[stackPtr++] = value;
+		else
+			localStackData[stackPtr++ - SHARED_STACK_SIZE] = value;
+	}
+
+	inline __device__ uint16_t StackPop(int& stackPtr, const uint16_t* sharedStackData, const uint16_t* localStackData)
+	{
+		if (stackPtr <= SHARED_STACK_SIZE)
+			return sharedStackData[--stackPtr];
+		else
+			return localStackData[--stackPtr - SHARED_STACK_SIZE];
+	}
+
 	[[nodiscard]] __device__ __host__ CPU_ONLY_INLINE bool Traverse(const Ray& ray, const float tmin, float tmax, HitRecord& bestHit)
 	{
 		const RenderParams* __restrict__ params = GetParams();
 
 		// Use registers for stack instead of memory
-		uint32_t currentNode = params->BVH->m_Root;
-		uint32_t stackData[16];
-		int		 stackPtr	 = 0;
-		bool	 hitAnything = false;
+		uint16_t currentNode = params->BVH->m_Root;
+
+#ifdef __CUDA_ARCH__
+		__shared__ uint16_t sharedStack[(MAX_THREADS * SHARED_STACK_SIZE * sizeof(uint16_t) + 3) / 4];
+#	define THREAD_INDEX (threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y)
+#	define DECLARE_STACK()                                                         \
+		uint16_t* sharedStackData = &sharedStack[THREAD_INDEX * SHARED_STACK_SIZE]; \
+		uint16_t  localStackData[LOCAL_STACK_SIZE]
+#else
+#	define DECLARE_STACK() uint16_t stackData[STACK_SIZE]
+#endif
+
+		DECLARE_STACK();
+		int	 stackPtr	 = 0;
+		bool hitAnything = false;
 
 		// Pre-compute ray inverse direction once
 		const Vec3 invDir				 = 1.0f / ray.Direction;
 		const Vec3 rayOriginMulNegInvDir = -ray.Origin * invDir;
 
+#ifdef __CUDA_ARCH__
+		StackPush(currentNode, stackPtr, sharedStackData, localStackData);
+#else
 		stackData[stackPtr++] = currentNode;
+#endif
 
 		// Front-to-back traversal for early termination
 		while (stackPtr != 0) [[likely]]
@@ -369,7 +405,12 @@ namespace BVH
 				// Process hit test
 				hitAnything |= Hitables::IntersectPrimitive(ray, tmin, tmax, bestHit, node.Left);
 
+#ifdef __CUDA_ARCH__
+				currentNode = StackPop(stackPtr, sharedStackData, localStackData);
+
+#else
 				currentNode = stackData[--stackPtr];
+#endif
 				continue;
 			}
 
@@ -435,11 +476,15 @@ namespace BVH
 #endif
 
 			// Resolve everything immediately
-			if (hitLeft & hitRight)
+			if (hitLeft && hitRight)
 			{
 				// Resolve early which side is first
-				currentNode			  = closerChild;
+				currentNode = closerChild;
+#ifdef __CUDA_ARCH__
+				StackPush(fartherChild, stackPtr, sharedStackData, localStackData);
+#else
 				stackData[stackPtr++] = fartherChild;
+#endif
 			}
 			else if (hitLeft ^ hitRight)
 			{
@@ -449,7 +494,12 @@ namespace BVH
 			{
 				if (stackPtr == 0)
 					break;
+#ifdef __CUDA_ARCH__
+				currentNode = StackPop(stackPtr, sharedStackData, localStackData);
+
+#else
 				currentNode = stackData[--stackPtr];
+#endif
 			}
 		}
 		return hitAnything;
